@@ -13,20 +13,22 @@
 # limitations under the License.
 
 
+from numbers import Rational
 import autograd
 import numpy as np
 import collections
 import scipy.optimize
 import scipy.stats
 
+import math
+import adaptdl.torch.data
+import adaptdl.collective
+import adaptdl.torch._metrics
+
+ratio_calculate = 0.5
 # Parameters for a performance model which predicts the per-step time of
 # distributed SGD using all-reduce. At a high level, models compute time and
-# network time separately, and combines them with some degree of overlap.
-# Compute time is modeled as a linear function of the local batch size.
-# Network time is modeled using different parameters depending on if the job
-# is inter-node (there exists a pair of replicas on different nodes), or
-# intra-node (all replicas are on the same node). For both cases, network time
-# is modeled as a constant term plus a retrogression term which increases
+# network time separately,0.4204269959950984 0.326 term plus a retrogression term which increases
 # linearly with the total number of replicas.
 PerfParams = collections.namedtuple("PerfParams", [
     # T_compute ~ alpha_c + beta_c * local_bsz +
@@ -62,27 +64,100 @@ class GoodputFunction(object):
         return self.evaluate(num_nodes, num_replicas, atomic_bsz, accum_steps)
 
     def evaluate(self, num_nodes, num_replicas, atomic_bsz, accum_steps):
-        batch_size = num_replicas * atomic_bsz * (accum_steps + 1)
-        assert np.all(self._init_batch_size <= batch_size)
+        # batch_size = num_replicas * atomic_bsz * (accum_steps + 1)
+        batch_size = atomic_bsz / adaptdl.torch.data.data_ratio * (accum_steps + 1)
+        # print("evaluate", batch_size)
+        # assert np.all(self._init_batch_size <= batch_size)
+        print("goodput", self.throughput(num_nodes, num_replicas, atomic_bsz,accum_steps), self.efficiency(batch_size))
         return self.throughput(num_nodes, num_replicas, atomic_bsz,
                                accum_steps) * self.efficiency(batch_size)
 
+    def evaluate_opt(self, num_nodes, num_replicas, atomic_bsz, accum_steps):
+        batch_size = atomic_bsz / ratio_calculate * (accum_steps + 1)
+        # assert np.all(self._init_batch_size <= batch_size)
+        return self.throughput_opt(num_nodes, num_replicas, atomic_bsz,
+                               accum_steps) * self.efficiency_opt(batch_size)
+
     def throughput(self, num_nodes, num_replicas, atomic_bsz, accum_steps):
+        global ratio_calculate 
+        # accum_time = _predict_accum_time(self._perf_params, atomic_bsz)
+        accum_time = adaptdl.torch._metrics._metrics_state().profile[adaptdl.torch._metrics.key]["accum_step_time"]
+        # print("accum time is:", accum_time)
+        # network_time = _predict_network_time(self._perf_params,
+        #                                      num_nodes, num_replicas)
+        network_time = adaptdl.torch._metrics._metrics_state().profile[adaptdl.torch._metrics.key]["optim_sync_time"]
+        # print("comm time is:", network_time)
+        # optim_time = np.exp(_predict_log_optim_time(self._perf_params,
+        #                                             accum_time, network_time))
+        # total_time = accum_steps * accum_time + optim_time
+        total_time = adaptdl.torch._metrics._metrics_state().profile[adaptdl.torch._metrics.key]["optim_step_time"]
+        
+        # print("total time",total_time)
+        accum_time += total_time - network_time
+        accum_time /= adaptdl.torch._metrics._metrics_state().profile[adaptdl.torch._metrics.key]["optim_count"]+ adaptdl.torch._metrics._metrics_state().profile[adaptdl.torch._metrics.key]["accum_count"]
+        total_time /= adaptdl.torch._metrics._metrics_state().profile[adaptdl.torch._metrics.key]["optim_count"]
+        print("accum time is:", accum_time)
+        print("total time",total_time)
+        sum_calculation_time = adaptdl.collective.allreduce(accum_time)
+        
+        time_ratio = accum_time / sum_calculation_time
+        time_ave_ratio = 1/num_replicas
+        print("check", time_ratio, time_ave_ratio, accum_time, sum_calculation_time)
+
+        intermedian_ratio = adaptdl.torch.data.data_ratio
+
+        if time_ave_ratio - time_ratio < -0.03 or time_ave_ratio - time_ratio > 0.03:
+    
+
+            if adaptdl.torch.data.data_ratio + (time_ave_ratio - time_ratio) > 0 and adaptdl.torch.data.data_ratio + (time_ave_ratio - time_ratio) < 1:
+        # if adaptdl.torch.data.data_ratio + (time_ave_ratio - time_ratio)/2 > 0 and adaptdl.torch.data.data_ratio + (time_ave_ratio - time_ratio)/2 < 1:
+                intermedian_ratio = adaptdl.torch.data.data_ratio + (time_ave_ratio - time_ratio)
+            else:
+                intermedian_ratio = adaptdl.torch.data.data_ratio
+        #     ratio_calculate = float(format(intermedian_ratio, '.2f'))
+        
+        # ratio_calculate = np.maximum(intermedian_ratio, -100)
+        ratio_calculate = np.maximum(0.5, -100)
+
+
+        # ratio_calculate = np(intermedian_ratio)
+        print("ratio_calculate", ratio_calculate)
+        # batch_size = num_replicas * atomic_bsz * (accum_steps + 1)
+        batch_size = atomic_bsz / adaptdl.torch.data.data_ratio * (accum_steps + 1)
+        # print("throughput",batch_size, total_time)
+        return batch_size / total_time
+
+    def throughput_opt(self, num_nodes, num_replicas, atomic_bsz, accum_steps):
         accum_time = _predict_accum_time(self._perf_params, atomic_bsz)
         network_time = _predict_network_time(self._perf_params,
                                              num_nodes, num_replicas)
         optim_time = np.exp(_predict_log_optim_time(self._perf_params,
                                                     accum_time, network_time))
         total_time = accum_steps * accum_time + optim_time
-        batch_size = num_replicas * atomic_bsz * (accum_steps + 1)
+        batch_size = atomic_bsz / ratio_calculate * (accum_steps + 1)
+        # print("throughput opt",batch_size, total_time)
         return batch_size / total_time
 
     def efficiency(self, batch_size):
         grad_sqr = self._grad_params.sqr
         grad_var = self._grad_params.var
+        print("var and grad", grad_var, grad_sqr)
         scale = batch_size / self._init_batch_size
+        # print("in efficiency,batch size and initial size",batch_size, self._init_batch_size )
         denom = grad_var / scale + grad_sqr
         gain = np.where(denom > 0, (grad_var + grad_sqr) / denom, 1.0)
+        print("efficiency", (grad_var / grad_sqr))
+        return gain / scale
+
+    def efficiency_opt(self, batch_size):
+        grad_sqr = self._grad_params.sqr
+        grad_var = self._grad_params.var
+        scale = batch_size / self._init_batch_size
+        # print("in opt efficiency,batch size and initial size",batch_size, self._init_batch_size )
+        denom = grad_var / scale + grad_sqr
+        gain = np.where(denom > 0, (grad_var + grad_sqr) / denom, 1.0)
+        # print("sqr and var", grad_sqr,  grad_var)
+        # print("efficiency opt", gain / scale)
         return gain / scale
 
     def optimize(self, num_nodes, num_replicas, max_batch_size=None,
@@ -100,11 +175,14 @@ class GoodputFunction(object):
         output_scalar = np.isscalar(num_nodes) or np.isscalar(num_replicas)
         num_nodes = np.broadcast_to(num_nodes, output_shape).flatten()
         num_replicas = np.broadcast_to(num_replicas, output_shape).flatten()
+        # print("num_replicas", num_replicas)
         # Samples 50 different total batch sizes in geometric space.
         min_batch_size = np.maximum(self._init_batch_size,
-                                    min_atomic_bsz * num_replicas)
+                                    min_atomic_bsz/ num_replicas.flatten())
         batch_size = np.geomspace(min_batch_size, max_batch_size)
-        local_bsz = batch_size / num_replicas
+
+        local_bsz = batch_size * ratio_calculate.flatten()
+        
         eps = 1e-8  # Tolerance for floor/ceil operations.
         if accumulation:
             # If local_bsz size exceeds the max atomic batch size, split it
@@ -119,22 +197,22 @@ class GoodputFunction(object):
             accum_steps = np.where(
                 np.logical_and(num_replicas == 1,
                                local_bsz > self._init_batch_size + eps),
-                np.maximum(accum_steps, 1), accum_steps).astype(int)
-            atomic_bsz = np.ceil(
-                local_bsz / (accum_steps + 1) - eps).astype(int)
+                np.maximum(accum_steps, 1), accum_steps).astype(float)
+            atomic_bsz = (local_bsz / (accum_steps + 1) - eps).astype(float)
         else:
             accum_steps = np.zeros_like(local_bsz, dtype=np.int)
             atomic_bsz = np.where(
                 num_replicas == 1,
-                self._init_batch_size, np.ceil(local_bsz - eps)).astype(int)
-
-        # Constrain the atomic_bsz before we evaluate the candidates
-        atomic_bsz = np.maximum(min_atomic_bsz, atomic_bsz)
-        atomic_bsz = np.minimum(max_atomic_bsz, atomic_bsz)
+                self._init_batch_size, (local_bsz - eps)).astype(float)
 
         # Evaluate the goodput of all candidate configurations.
-        goodput = self.evaluate(num_nodes, num_replicas,
+        # print("geospace", atomic_bsz)
+
+        goodput = self.evaluate_opt(num_nodes, num_replicas,
                                 atomic_bsz, accum_steps)
+        # Set the goodput of invalid configurations to 0.0.
+        goodput = np.where((min_atomic_bsz <= atomic_bsz) &
+                           (atomic_bsz <= max_atomic_bsz), goodput, 0.0)
         # Find the indices of the best configurations.
         indices = np.argmax(goodput, axis=0), np.arange(goodput.shape[1])
         # Restore the correct output shape and return results.
@@ -145,8 +223,71 @@ class GoodputFunction(object):
             goodput = goodput.item()
             atomic_bsz = atomic_bsz.item()
             accum_steps = accum_steps.item()
+        atomic_bsz = math.ceil(atomic_bsz)
+        print("optimized batch",atomic_bsz, goodput)
         return goodput, atomic_bsz, accum_steps
 
+
+    # def optimize(self, num_nodes, num_replicas, max_batch_size=None,
+    #                 atomic_bsz_range=None, accumulation=False):
+    #         assert np.all(np.less_equal(1, num_nodes))
+    #         assert np.all(np.less_equal(num_nodes, num_replicas))
+    #         if max_batch_size is None:
+    #             max_batch_size = self._init_batch_size
+    #         assert self._init_batch_size <= max_batch_size
+    #         atomic_bsz_range = atomic_bsz_range or (None, None)
+    #         min_atomic_bsz = atomic_bsz_range[0] or 1
+    #         max_atomic_bsz = atomic_bsz_range[1] or max_batch_size
+    #         # Remember what the output shape/format should be and flatten inputs.
+    #         output_shape = np.broadcast(num_nodes, num_replicas).shape
+    #         output_scalar = np.isscalar(num_nodes) or np.isscalar(num_replicas)
+    #         num_nodes = np.broadcast_to(num_nodes, output_shape).flatten()
+    #         num_replicas = np.broadcast_to(num_replicas, output_shape).flatten()
+    #         # Samples 50 different total batch sizes in geometric space.
+    #         min_batch_size = np.maximum(self._init_batch_size,
+    #                                     min_atomic_bsz * num_replicas)
+    #         batch_size = np.geomspace(min_batch_size, max_batch_size)
+    #         local_bsz = batch_size / num_replicas
+    #         eps = 1e-8  # Tolerance for floor/ceil operations.
+    #         if accumulation:
+    #             # If local_bsz size exceeds the max atomic batch size, split it
+    #             # into a number of batches to form (atomic_bsz, accum_steps) such
+    #             # that (atomic_bsz * (accum_steps + 1)) is close to local_bsz.
+    #             #
+    #             # If num_replicas == 1 and local_bsz > self._init_batch_size, then
+    #             # set accum_steps to at least 1. This is because the gradient
+    #             # statistics used for scaling up the learning rate are inaccurate
+    #             # when there is only one atomic minibatch to estimate them from.
+    #             accum_steps = np.ceil(local_bsz / max_atomic_bsz - eps) - 1
+    #             accum_steps = np.where(
+    #                 np.logical_and(num_replicas == 1,
+    #                             local_bsz > self._init_batch_size + eps),
+    #                 np.maximum(accum_steps, 1), accum_steps).astype(int)
+    #             atomic_bsz = np.ceil(
+    #                 local_bsz / (accum_steps + 1) - eps).astype(int)
+    #         else:
+    #             accum_steps = np.zeros_like(local_bsz, dtype=np.int)
+    #             atomic_bsz = np.where(
+    #                 num_replicas == 1,
+    #                 self._init_batch_size, np.ceil(local_bsz - eps)).astype(int)
+
+    #         # Evaluate the goodput of all candidate configurations.
+    #         goodput = self.evaluate_opt(num_nodes, num_replicas,
+    #                                 atomic_bsz, accum_steps)
+    #         # Set the goodput of invalid configurations to 0.0.
+    #         goodput = np.where((min_atomic_bsz <= atomic_bsz) &
+    #                         (atomic_bsz <= max_atomic_bsz), goodput, 0.0)
+    #         # Find the indices of the best configurations.
+    #         indices = np.argmax(goodput, axis=0), np.arange(goodput.shape[1])
+    #         # Restore the correct output shape and return results.
+    #         goodput = goodput[indices].reshape(output_shape)
+    #         atomic_bsz = atomic_bsz[indices].reshape(output_shape)
+    #         accum_steps = accum_steps[indices].reshape(output_shape)
+    #         if output_scalar:
+    #             goodput = goodput.item()
+    #             atomic_bsz = atomic_bsz.item()
+    #             accum_steps = accum_steps.item()
+    #         return goodput, atomic_bsz, accum_steps
 
 def fit_perf_params(num_nodes, num_replicas, atomic_bsz,
                     accum_step_time, optim_step_time):
@@ -160,6 +301,7 @@ def fit_perf_params(num_nodes, num_replicas, atomic_bsz,
     global np  # Replace numpy from autograd.
     orig_np = np
     np = autograd.numpy
+    
 
     num_nodes = np.array(num_nodes)
     num_replicas = np.array(num_replicas)
@@ -196,10 +338,12 @@ def fit_perf_params(num_nodes, num_replicas, atomic_bsz,
     args = (num_nodes, num_replicas, atomic_bsz,
             accum_step_time, optim_step_time)
     # FIXME: need to handle optimization failures and propagate to the Trainer.
+    #print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     grad_fn = autograd.grad(_obj_fn)
     result = scipy.optimize.minimize(_obj_fn, params, args=args,
                                      jac=grad_fn, bounds=bounds)
     params = result.x
+    # print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     if not any(num_nodes > 1):
         # Enforce prior: alpha_n and beta_n are at least alpha_r and beta_r.
         params[2] = max(params[2], params[4] * 1.1)
@@ -257,3 +401,4 @@ def _predict_network_time(params, num_nodes, num_replicas):
     retrogress = np.select(conds, [params.beta_n, params.beta_r], 1e-8)
     retrogress = retrogress * np.maximum(num_replicas - 2, 1e-8)
     return (bottleneck + retrogress)
+

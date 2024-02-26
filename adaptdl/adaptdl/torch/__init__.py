@@ -31,7 +31,7 @@ import adaptdl.collective
 import adaptdl.env
 import semver
 from .epoch import current_epoch, finished_epochs, remaining_epochs_until
-from .data import current_dataloader, AdaptiveDataLoader, ElasticSampler
+from .data import current_dataloader, AdaptiveDataLoader, ElasticSampler, ElasticHeteroSampler, HeteroDataLoader
 from .parallel import AdaptiveDataParallel
 from .accumulator import Accumulator
 
@@ -139,4 +139,7 @@ __all__ = [
     "ElasticSampler",
     "AdaptiveDataParallel",
     "Accumulator",
+    "HeteroDataLoader",
+    "ElasticHeteroSampler",
 ]
+

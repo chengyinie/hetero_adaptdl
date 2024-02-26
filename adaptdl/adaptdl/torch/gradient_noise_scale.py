@@ -9,6 +9,10 @@ from torch.autograd import Variable
 
 import adaptdl.utils
 
+import adaptdl.torch.data
+import adaptdl.torch.parallel
+import adaptdl.collective
+
 __all__ = ["GradientNoiseScale"]
 
 logging.basicConfig(level=logging.INFO)
@@ -116,6 +120,7 @@ class GradientNoiseScale(object):
 
         Returns (float): Estimate of squared l2-norm.
         """
+        # print("sqr average", float(np.sum(np.maximum(self._state["sqr_avg"], 0.0))))
         return float(np.sum(np.maximum(self._state["sqr_avg"], 0.0)))
 
     @property
@@ -131,6 +136,7 @@ class GradientNoiseScale(object):
 
         Returns (float): Estimate of trace of the covariance.
         """
+        # print("var average", float(np.sum(np.maximum(self._state["var_avg"], 1e-6))))
         return float(np.sum(np.maximum(self._state["var_avg"], 1e-6)))
 
     def get_progress(self):
@@ -199,9 +205,15 @@ class GradientNoiseScale(object):
             # Asynchronously sum the local squared-gradient statistics. The
             # actual gradient averaging should also be happening at the same
             # time, until self._final_callback is invoked.
-            if self._num_replicas > 1:
-                self._async_op = torch.distributed.all_reduce(self._local_sqr,
-                                                              async_op=True)
+            
+            # if self._num_replicas > 1:
+                # self._async_op = torch.distributed.all_reduce(self._local_sqr,
+                #                                               async_op=True)
+                # print("local gradient", self._local_sqr)
+                # self._local_sqr = self._local_sqr *2 * (adaptdl.torch.data.data_ratio)
+                # self._local_sqr = adaptdl.collective.allreduce(self._local_sqr)
+                
+            # print("local gradient", self._local_sqr)
             Variable._execution_engine.queue_callback(self._final_callback)
             self._should_zero_grad = True
         else:
@@ -212,8 +224,10 @@ class GradientNoiseScale(object):
     def _final_callback(self):
         # This method should be invoked once the gradients have been
         # synchronized between all replicas and accumulation steps.
-        if self._num_replicas > 1:
-            self._async_op.wait()
+        # if self._num_replicas > 1:
+        #     self._async_op.wait()
+        #     # self._async_op
+        
         grads = []
         if self._mp_scaler is not None:
             mixed_precision_scale = self._mp_scaler.get_scale()
@@ -225,9 +239,9 @@ class GradientNoiseScale(object):
                 if param.grad is None:
                     grads[-1].append(None)
                     continue
-                param.grad.div_(self._accum_count)
-                grads[-1].append(param.grad.detach().float() /
-                                 mixed_precision_scale)
+                grad = param.grad.detach().float()
+                grads[-1].append(
+                    grad / mixed_precision_scale / self._accum_count)
         preconditioner = self._get_preconditioner()
 
         # Note: mixed precision can result in nan/inf gradients,
@@ -236,18 +250,22 @@ class GradientNoiseScale(object):
         # there are nan/inf, so we also skip the update here
         grads_normsqr = _normsqr_groups(grads, preconditioner)
         if not np.all(np.isfinite(grads_normsqr)):
-            LOG.warning(f"GradientNoiseScale detected invalid gradient! "
-                        f"at scale {mixed_precision_scale}, Skipping step.")
+            LOG.warning("GradientNoiseScale detected invalid gradient! "
+                        "Skipping step.")
             return
+        # count = math.ceil(self._accum_count / adaptdl.torch.data.data_ratio)
         count = self._num_replicas * self._accum_count
         scale = self._accum_scale * self._accum_count
+
         if count > 1:
             # Average local squared-norm samples.
-            local_sqr = self._local_sqr.cpu().numpy() / count
+            local_sqr = self._local_sqr.cpu().numpy() /self._accum_count
+            # print(local_sqr)
             # Gradient is squared in local_sqr, so need to square the
             # mixed precision scale as well
             local_sqr = (local_sqr / mixed_precision_scale ** 2)
             total_sqr = grads_normsqr
+            # print("global gradient", total_sqr)
             if self._state["biased"]:
                 self._reset_avg("sqr_avg")
                 self._reset_avg("var_avg")
@@ -266,8 +284,65 @@ class GradientNoiseScale(object):
             self._prev_grads = [[g.clone() if g is not None else None
                                  for g in group] for group in grads]
         if count > 1:
-            grad_sqr = (count * total_sqr - local_sqr) / (count - 1)
-            grad_var = (local_sqr - total_sqr) * scale / (count - 1)
+            def make_A_G(B,b):
+                A = np.zeros([len(b),len(b)])
+                for i in range(len(b)):
+                    for j in range(len(b)):
+                        if i == j:
+                            A[i][j] = (B+2*b[i])/(B**2-B*b[i])
+                        else:
+                            A[i][j] = (B**2-b[i]**2-b[j]**2)/(B*(B-b[i])*(B-b[j]))
+                return A
+
+            def make_A_S(B,b):
+                A = np.zeros([len(b),len(b)])
+                for i in range(len(b)):
+                    for j in range(len(b)):
+                        if i == j:
+                            A[i][j] = (B*b[i])/(B-b[i])
+                        else:
+                            A[i][j] = (b[i]*b[j]*(B-b[i]-b[j]))/((B-b[i])*(B-b[j]))
+                return A
+
+            def opt_weights(B,b,est_type):
+                if est_type not in ['G','S']:
+                    raise ValueError("invalid input: choose estimator type")
+                
+                if sum(b)!=B: 
+                    raise ValueError("invalid input: b_i do not sum to B")
+                    
+                if not all(b):
+                    raise ValueError("invalid input: cannot have b_i=0")
+                
+                if est_type == 'G':
+                    A = np.linalg.inv(make_A_G(B,b))
+                else:
+                    A = np.linalg.inv(make_A_S(B,b))
+                w = A.dot(np.ones(len(b)))/np.ones(len(b)).dot(A.dot(np.ones(len(b))))
+                return w
+
+            w_norm = opt_weights(1,[adaptdl.torch.data.data_ratio,1-adaptdl.torch.data.data_ratio],'G')
+            w_var = opt_weights(1, [adaptdl.torch.data.data_ratio,1-adaptdl.torch.data.data_ratio],'S')
+            # grad_sqr = (count * total_sqr - local_sqr) / (count - 1)
+            # grad_var = (local_sqr - total_sqr) * scale / (count - 1)
+            # print("data ratio", adaptdl.torch.data.data_ratio)
+            grad_sqr = ((total_sqr / adaptdl.torch.data.data_ratio - local_sqr) / (1 / adaptdl.torch.data.data_ratio - 1)) * w_norm[0]
+            grad_sqr = adaptdl.collective.allreduce(grad_sqr) 
+            grad_var = ((local_sqr - total_sqr) * scale / (1 / adaptdl.torch.data.data_ratio - 1)) * w_var[0]
+            grad_var = adaptdl.collective.allreduce(grad_var) 
+            # grad_sqr = torch.tensor((total_sqr / adaptdl.torch.data.data_ratio - local_sqr) / (1 / adaptdl.torch.data.data_ratio - 1)/ self._num_replicas)
+            # grad_sqr = grad_sqr.to(device='cuda')
+
+            # grad_sqr = torch.distributed.all_reduce(grad_sqr, async_op=True) 
+            # # grad_sqr.wait()
+            # grad_var = torch.tensor((local_sqr - total_sqr) * scale / (1 / adaptdl.torch.data.data_ratio - 1)/ self._num_replicas)
+            # grad_var = grad_var.to(device='cuda')
+            # grad_var = torch.distributed.all_reduce(grad_var, async_op=True) 
+            # grad_sqr = np.float(torch.tensor(grad_sqr).cpu())
+            # grad_var = np.float(torch.tensor(grad_var).cpu())
+
+            # grad_var.wait()
+            # print("grad_sqr", grad_sqr)
             theta = self._smoothing ** scale
             self._update_avg('sqr_avg', grad_sqr, theta)
             self._update_avg('var_avg', grad_var, theta)
@@ -307,7 +382,7 @@ class AdamGradientNoiseScale(GradientNoiseScale):
         eps = self._adam_param_group['eps'][idx]
         correction = 1 - beta2 ** state['step']
         pinv = (exp_avg_sq.sqrt() / math.sqrt(correction)).add_(eps)
-        return pinv.to(param.device)
+        return pinv
 
     def _reset_adam_state(self, step=0):
         for group in self._optimizer.param_groups:
@@ -324,7 +399,8 @@ class AdamGradientNoiseScale(GradientNoiseScale):
     def _final_callback(self):
         scale = self._accum_scale * self._accum_count
         if not np.isclose(scale, self._state["prev_scale"]):
-            # reset Adam states when scale is changed
             self._reset_adam_state()
+            # reset Adam states when scale is changed
             self._state["prev_scale"] = scale
         return super()._final_callback()
+

@@ -21,7 +21,7 @@ from typing import Optional
 
 import torch
 import torch.cuda
-import torch.distributed
+import torch.distributed as dist
 from torch.autograd import Variable
 from torch.nn.parallel import DistributedDataParallel
 
@@ -29,11 +29,51 @@ import adaptdl.checkpoint
 import adaptdl.env
 import adaptdl.utils
 from adaptdl.torch.data import current_dataloader
+import adaptdl.torch.data
 from adaptdl.torch.scaling_rules import AdaScale, AdamScale, ScalingRuleBase
 from adaptdl.torch.gradient_noise_scale import GradientNoiseScale,\
                                                AdamGradientNoiseScale
 from adaptdl.torch._metrics import profile_sync_time, update_grad_params,\
                                    update_progress
+
+# data_ratio = 0.5
+
+def _allreduce_fut_proportion(
+    process_group: dist.ProcessGroup, tensor: torch.Tensor
+) -> torch.futures.Future[torch.Tensor]:
+    "Averages the input gradient tensor by allreduce and returns a future."
+    group_to_use = process_group if process_group is not None else dist.group.WORLD
+
+    # Apply the division first to avoid overflow, especially for FP16.
+    # tensor.div_(group_to_use.size())
+    # print(group_to_use.size())
+    # print("check in prop all reduce", adaptdl.torch.data.data_ratio)
+    tensor = tensor * (adaptdl.torch.data.data_ratio) #* 2
+
+    return (
+        dist.all_reduce(tensor, group=group_to_use, async_op=True)
+        .get_future()
+        .then(lambda fut: fut.value()[0])
+    )
+
+def proportional_allreduce_hook(
+        process_group: dist.ProcessGroup, bucket: dist.GradBucket
+) -> torch.futures.Future[torch.Tensor]:
+    return _allreduce_fut_proportion(process_group, bucket.buffer())
+
+
+# def _proportional_reduce_hook(process_group: dist.ProcessGroup, tensor: torch.Tensor)-> torch.futures.Future[torch.Tensor]:
+#         # group_to_use = process_group if process_group is not None else dist.group.WORLD
+#         proportional_grad = tensor().mul_(0.01)
+#         fut = dist.all_reduce(
+#             proportional_grad, async_op=True
+#         ).get_future()
+
+#         def ratio_grad(fut):
+#             final_grad = tensor()
+#             return final_grad
+
+#         return fut.then(ratio_grad)
 
 
 class AdaptiveDataParallel(DistributedDataParallel):
@@ -43,7 +83,6 @@ class AdaptiveDataParallel(DistributedDataParallel):
     saves the given model, optimizer, and (optionally) LR scheduler whenever a
     checkpoint is triggered, and restores their states after restart. The
     optimizer is automatically patched with the chosen scaling rule.
-
     Arguments:
         model (torch.nn.Module): Model to be distributed.
         optimizer (torch.optim.Optimizer): Optimizer used to update the given
@@ -66,8 +105,11 @@ class AdaptiveDataParallel(DistributedDataParallel):
         # internal behavior of DistributedDataParallel, but seems to be abused
         # pretty widely so there should be little chance of it changing.
         # https://discuss.pytorch.org/t/59291
+        DistributedDataParallel.register_comm_hook(self, state=None, hook=proportional_allreduce_hook)
+        # print("register proportional reduce hook")
         for param in model.parameters():
             param.register_hook(functools.partial(self._backward_hook, param))
+        
 
         # Setup for the scaling_rule, must be after registering backward hooks
         # because some of them need to register their own backward hooks.
@@ -90,13 +132,30 @@ class AdaptiveDataParallel(DistributedDataParallel):
 
         self._sync_start = None
 
+
+    # def _proportional_reduce_hook(process_group: dist.ProcessGroup, bucket: dist.GradBucket)-> torch.futures.Future:
+    #     group_to_use = process_group if process_group is not None else dist.group.WORLD
+    #     proportional_grad = bucket.get_tensor().mul_(0.01)
+    #     fut = dist.all_reduce(
+    #         proportional_grad, async_op=True
+    #     ).get_future()
+
+    #     def ratio_grad(fut):
+    #         final_grad = bucket.get_tensor()
+    #         return final_grad
+
+    #     return fut.then(ratio_grad)
+
+
     def forward(self, *args, **kwargs):
         # Do not do gradient synchronization during gradient accumulation.
         dataloader = current_dataloader()
         if dataloader is not None and dataloader.training:
             self.require_backward_grad_sync = dataloader.is_optim_step()
-            accum_scale = (dataloader.current_local_bsz *
-                           adaptdl.env.num_replicas() / dataloader.batch_size)
+            # accum_scale = (dataloader.current_local_bsz *
+            #                adaptdl.env.num_replicas() / dataloader.batch_size)
+            accum_scale = (dataloader.current_local_bsz / \
+                           adaptdl.torch.data.data_ratio / dataloader.batch_size)
             self.gns.set_accum_scale(accum_scale)
         return super().forward(*args, **kwargs)
 
@@ -111,6 +170,7 @@ class AdaptiveDataParallel(DistributedDataParallel):
             self._sync_start = time.time()
         self._final_callback_queued = False
         Variable._execution_engine.queue_callback(self._queue_callback)
+        # print("parallel 3")
 
     @adaptdl.utils.print_exc
     def _queue_callback(self):
@@ -125,6 +185,7 @@ class AdaptiveDataParallel(DistributedDataParallel):
             return
         self._final_callback_queued = True
         Variable._execution_engine.queue_callback(self._final_callback)
+        # print("parallel 1")
 
     @adaptdl.utils.print_exc
     def _final_callback(self):
@@ -153,6 +214,7 @@ class AdaptiveDataParallel(DistributedDataParallel):
         dataloader.train()
 
         scale = dataloader.current_batch_size / dataloader.batch_size
+
         self._state.gain = self.gns.gain(scale)
         self._state.lr_factor = \
             np.average(self.scaling_rule.scale_lr(scale))
@@ -162,6 +224,8 @@ class AdaptiveDataParallel(DistributedDataParallel):
             update_grad_params(self._key, self.gns.sqr_avg(),
                                self.gns.var_avg())
         self._sync_start = None
+        # print("parallel 2")
+        
 
     def zero_grad(self, *args, **kwargs):
         warnings.warn("zero_grad has no effect with AdaptiveDataParallel")
@@ -176,7 +240,6 @@ class AdaptiveDataParallel(DistributedDataParallel):
     def to_tensorboard(self, writer, global_step, tag_prefix=""):
         """
         Output some useful metrics to TensorBoard.
-
         Arguments:
             writer (torch.utils.tensorboard.SummaryWriter): ``SummaryWriter``
                 object to output metrics to.
@@ -193,13 +256,6 @@ class AdaptiveDataParallel(DistributedDataParallel):
                           self._state.gain, global_step)
         writer.add_scalar(tag_prefix + "Learning_Rate_Factor",
                           self._state.lr_factor, global_step)
-        writer.add_scalar(tag_prefix + "Accum_Scale",
-                          self.gns.accum_scale, global_step)
-        if self.gns.accum_count > 0:
-            writer.add_scalar(tag_prefix + "Accum_Count",
-                              self.gns.accum_count, global_step)
-        writer.add_scalar(tag_prefix + "Progress",
-                          self.gns.get_progress(), global_step)
 
 
 class _AdaptiveDataParallelState(adaptdl.checkpoint.State):
