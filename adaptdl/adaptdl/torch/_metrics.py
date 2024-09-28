@@ -31,10 +31,12 @@ def profile_step_start(atomic_bsz):
     state.atomic_bsz = atomic_bsz
     state.step_start = time.time()
     state.sync_time = 0.0
+    
 
 
 def profile_sync_time(sync_time):
     _metrics_state().sync_time += sync_time
+    
 
 
 _PREV_REPORT = None
@@ -42,8 +44,10 @@ _PREV_REPORT = None
 
 def profile_step_commit(accumulation_step=False):
     global _PREV_REPORT
+    global key
     state = _metrics_state()
     step_time = time.time() - state.step_start
+    
     num_nodes = adaptdl.env.num_nodes()
     num_replicas = adaptdl.env.num_replicas()
     key = (num_nodes, num_replicas, state.atomic_bsz)
@@ -54,16 +58,22 @@ def profile_step_commit(accumulation_step=False):
         state.profile[key]["optim_step_time"] += step_time
         state.profile[key]["optim_sync_time"] += state.sync_time
         state.profile[key]["optim_count"] += 1
+    # print("key", key)
+    # print("step time", state.profile[key]["optim_step_time"])
+    # print("sync time", state.profile[key]["optim_sync_time"])
+        
     del state.atomic_bsz
     del state.step_start
     del state.sync_time
     if not accumulation_step:
         if _PREV_REPORT is None:
             _PREV_REPORT = time.time()
-        if adaptdl.env.replica_rank() == 0 and time.time() - _PREV_REPORT > 30:
+        # if adaptdl.env.replica_rank() == 0 and time.time() - _PREV_REPORT > 30:
+        if time.time() - _PREV_REPORT > 30:
             _fit_perf_params()
             _report_sched_hints()
             _PREV_REPORT = time.time()
+
 
 
 _GRAD_PARAM_DICT = {}
@@ -71,8 +81,11 @@ _GRAD_PARAM_DICT = {}
 
 def update_grad_params(edp_key, grad_norm_sqr, grad_variance):
     global _GRAD_PARAM_DICT
+    # print("input:", grad_norm_sqr, grad_variance)
     _GRAD_PARAM_DICT[edp_key] = np.asarray([grad_norm_sqr, grad_variance])
+    # print("dictionary", _GRAD_PARAM_DICT[edp_key])
     grad_params = sum(_GRAD_PARAM_DICT.values())
+    # print("grad params:", grad_params)
     _metrics_state().grad_params = (grad_params[0], grad_params[1])
 
 
@@ -119,10 +132,14 @@ def _fit_perf_params():
     # Non-sync time during optimization steps should be approximately equal to
     # accumulation step time, combine those data points.
     assert np.all(optim_step_time >= optim_sync_time)
+
     accum_step_time += optim_step_time - optim_sync_time
+    
     accum_count += optim_count
+    print("check some parameters:", accum_step_time, optim_step_time, optim_sync_time)
     accum_step_time /= accum_count
     optim_step_time /= optim_count
+    print("check some parameters:", accum_step_time, optim_step_time)
     state.perf_params = fit_perf_params(num_nodes, num_replicas, atomic_bsz,
                                         accum_step_time, optim_step_time)
 
@@ -136,7 +153,7 @@ def _get_sched_hints():
 
 
 def _report_sched_hints():
-    assert adaptdl.env.replica_rank() == 0
+    # assert adaptdl.env.replica_rank() == 0
     state = _metrics_state()
     # Scheduling hints
     sched_hints = SCHED_HINTS.copy()
