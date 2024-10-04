@@ -36,11 +36,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
-parser.add_argument('--bs', default=128, type=int, help='batch size')
+parser.add_argument('--bs', default=100, type=int, help='batch size')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
 parser.add_argument('--epochs', default=60, type=int, help='number of epochs')
 parser.add_argument('--model', default='ResNet18', type=str, help='model')
-parser.add_argument('--autoscale-bsz', dest='autoscale_bsz', default=False,
+parser.add_argument('--autoscale-bsz', dest='autoscale_bsz', default=True,
                     action='store_true', help='autoscale batchsize')
 parser.add_argument('--mixed-precision', dest='mixed_precision', default=False,
                     action='store_true', help='use automatic mixed precision')
@@ -65,18 +65,18 @@ transform_test = transforms.Compose([
 adaptdl.torch.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
 
 if adaptdl.env.replica_rank() == 0:
-    trainset = torchvision.datasets.CIFAR10(root=adaptdl.env.share_path(), train=True, download=True, transform=transform_train)
-    trainloader = adl.AdaptiveDataLoader(trainset, batch_size=args.bs, shuffle=True, num_workers=2, drop_last=True)
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+    trainloader = adl.HeteroDataLoader(trainset, batch_size=args.bs, shuffle=True, num_workers=2, drop_last=True)
     dist.barrier()  # We use a barrier here so that non-master replicas would wait for master to download the data
 else:
     dist.barrier()
-    trainset = torchvision.datasets.CIFAR10(root=adaptdl.env.share_path(), train=True, download=False, transform=transform_train)
-    trainloader = adl.AdaptiveDataLoader(trainset, batch_size=args.bs, shuffle=True, num_workers=2, drop_last=True)
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=False, transform=transform_train)
+    trainloader = adl.HeteroDataLoader(trainset, batch_size=args.bs, shuffle=True, num_workers=2, drop_last=True)
 
 if args.autoscale_bsz:
-    trainloader.autoscale_batch_size(4096, local_bsz_bounds=(32, 1024), gradient_accumulation=False)
+    trainloader.autoscale_batch_size(4000, local_bsz_bounds=(20, 4000), gradient_accumulation=False)
 
-validset = torchvision.datasets.CIFAR10(root=adaptdl.env.share_path(), train=False, download=False, transform=transform_test)
+validset = torchvision.datasets.CIFAR10(root='./data', train=False, download=False, transform=transform_test)
 validloader = adl.AdaptiveDataLoader(validset, batch_size=100, shuffle=False, num_workers=2)
 
 # Model
@@ -159,11 +159,13 @@ def valid(epoch):
         print("Valid:", stats)
 
 
-tensorboard_dir = os.path.join(os.getenv("ADAPTDL_TENSORBOARD_LOGDIR", "/tmp")
-                               if adaptdl.env.replica_rank() == 0 else "/tmp",
-                               adaptdl.env.job_id())
+# tensorboard_dir = os.path.join(os.getenv("ADAPTDL_TENSORBOARD_LOGDIR", "/tmp")
+#                                if adaptdl.env.replica_rank() == 0 else "/tmp",
+#                                adaptdl.env.job_id())
+tensorboard_dir = './tensorboard'
 with SummaryWriter(tensorboard_dir) as writer:
     for epoch in adl.remaining_epochs_until(args.epochs):
         train(epoch)
         valid(epoch)
         lr_scheduler.step()
+
