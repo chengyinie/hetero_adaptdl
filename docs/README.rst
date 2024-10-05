@@ -2,13 +2,14 @@
 
 Introduction
 ------------
+Source code of Middleware'24 paper: Cannikin: Optimal Adaptive Distributed DNN Training over Heterogeneous Clusters
 
 
 
 Easy-to-use Elastic API
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-Aladdin introduced the HeteroDataLoader for adaptive batch size training over heterogeneous clusters. For other APIs, refer the AdaptDL `Documentation <https://adaptdl.readthedocs.org>`
+Aladdin introduced the HeteroDataLoader for adaptive batch size training over heterogeneous clusters. For other APIs, refer the AdaptDL `Documentation <https://adaptdl.readthedocs.org>`_
 
 **BEFORE:**
 
