@@ -6,8 +6,8 @@ Source code of Middleware'24 paper: `Cannikin: Optimal Adaptive Distributed DNN 
 
 Environment setup
 ^^^^^^^^^^^^^^^^^^
-
-
+Docker image: `pytorch/pytorch   2.1.0-cuda12.1-cudnn8-devel <https://hub.docker.com/layers/pytorch/pytorch/2.1.0-cuda12.1-cudnn8-devel/images/sha256-fe174e1e257d29976c99ebe9832d9bb20bd9706ea8eff1482cc9af261998c48d?context=explore>`_
+Numpy version: 1.22.4
 
 Easy-to-use Elastic API
 ^^^^^^^^^^^^^^^^^^^^^^^
