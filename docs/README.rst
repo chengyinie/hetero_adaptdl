@@ -2,7 +2,7 @@
 
 Introduction
 ------------
-Source code of Middleware'24 paper: Cannikin: Optimal Adaptive Distributed DNN Training over Heterogeneous Clusters
+Source code of Middleware'24 paper: `Cannikin: Optimal Adaptive Distributed DNN Training over Heterogeneous Clusters <https://arxiv.org/abs/2402.05302>`_
 
 
 
