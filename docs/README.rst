@@ -4,6 +4,9 @@ Introduction
 ------------
 Source code of Middleware'24 paper: `Cannikin: Optimal Adaptive Distributed DNN Training over Heterogeneous Clusters <https://arxiv.org/abs/2402.05302>`_
 
+Environment setup
+^^^^^^^^^^^^^^^^^^
+
 
 
 Easy-to-use Elastic API
